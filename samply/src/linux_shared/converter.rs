@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use byteorder::LittleEndian;
 use debugid::DebugId;
@@ -10,7 +11,7 @@ use fxprof_processed_profile::{
     Category, CategoryColor, CategoryHandle, CpuDelta, FrameFlags, LibraryHandle, LibraryInfo,
     Marker, MarkerField, MarkerTiming, PlatformSpecificReferenceTimestamp, Profile,
     ReferenceTimestamp, SamplingInterval, Schema, StringHandle, SubcategoryHandle, SymbolTable,
-    ThreadHandle,
+    ThreadHandle, Timestamp,
 };
 use linux_perf_data::linux_perf_event_reader::TaskWasPreempted;
 use linux_perf_data::simpleperf_dso_type::{DSO_DEX_FILE, DSO_KERNEL, DSO_KERNEL_MODULE};
@@ -110,6 +111,9 @@ where
 
     /// Whether to emit context switch markers.
     should_emit_cswitch_markers: bool,
+
+    time_range: Option<(Duration, Duration)>,
+    time_range_ts: Option<(Timestamp, Timestamp)>,
 }
 
 struct SimpleperfConverterData {
@@ -146,6 +150,8 @@ where
         interpretation: EventInterpretation,
         simpleperf_symbol_tables: Option<Vec<SimpleperfFileRecord>>,
         call_chain_return_addresses_are_preadjusted: bool,
+        is_simpleperf: bool,
+        time_range: Option<(Duration, Duration)>,
     ) -> Self {
         let interval = match interpretation.sampling_is_time_based {
             Some(nanos) => SamplingInterval::from_nanos(nanos),
@@ -186,6 +192,17 @@ where
             &mut profile,
         );
 
+        let time_range_ts = if !is_simpleperf {
+            time_range.map(|(start, end)| {
+                (
+                    Timestamp::from_nanos_since_reference(start.as_nanos() as u64),
+                    Timestamp::from_nanos_since_reference(end.as_nanos() as u64),
+                )
+            })
+        } else {
+            None
+        };
+
         Self {
             profile,
             cache,
@@ -219,6 +236,8 @@ where
             call_chain_return_addresses_are_preadjusted,
             should_emit_jit_markers: profile_creation_props.should_emit_jit_markers,
             should_emit_cswitch_markers: profile_creation_props.should_emit_cswitch_markers,
+            time_range,
+            time_range_ts,
         }
     }
 
@@ -244,6 +263,27 @@ where
         self.profile.set_os_name(os_name);
     }
 
+    // For simpleperf profiles, we need to get the first sample time lazily and adjust the time range.
+    fn init_time_range(&mut self, first_sample_ts: u64) {
+        if self.time_range_ts.is_some() {
+            return;
+        }
+        if let Some((start, stop)) = self.time_range {
+            self.time_range_ts = Some((
+                Timestamp::from_nanos_since_reference(first_sample_ts + start.as_nanos() as u64),
+                Timestamp::from_nanos_since_reference(first_sample_ts + stop.as_nanos() as u64),
+            ));
+        }
+    }
+
+    fn is_in_time_range(&self, ts_raw: u64) -> bool {
+        let Some((tstart, tstop)) = self.time_range_ts else {
+            return true;
+        };
+        let ts = self.timestamp_converter.convert_time(ts_raw);
+        ts >= tstart && ts < tstop
+    }
+
     pub fn handle_main_event_sample<C: ConvertRegs<UnwindRegs = U::UnwindRegs>>(
         &mut self,
         e: &SampleRecord,
@@ -258,6 +298,10 @@ where
             .timestamp
             .expect("Can't handle samples without timestamps");
         self.current_sample_time = timestamp;
+        self.init_time_range(timestamp);
+        if !self.is_in_time_range(timestamp) {
+            return;
+        }
 
         let profile_timestamp = self.timestamp_converter.convert_time(timestamp);
 
@@ -392,6 +436,12 @@ where
     ) {
         let pid = e.pid.expect("Can't handle samples without pids");
         let tid = e.tid.expect("Can't handle samples without tids");
+        let timestamp_mono = e
+            .timestamp
+            .expect("Can't handle context switch without time");
+        if !self.is_in_time_range(timestamp_mono) {
+            return;
+        }
         let process = self.processes.get_by_pid(pid, &mut self.profile);
         process.check_jitdump(
             &mut self.jit_category_manager,
@@ -415,9 +465,6 @@ where
         let thread = process.threads.get_thread_by_tid(tid, &mut self.profile);
         thread.off_cpu_stack = Some(stack_index);
 
-        let timestamp_mono = e
-            .timestamp
-            .expect("Can't handle context switch without time");
         if self.off_cpu_indicator == Some(OffCpuIndicator::SchedSwitchAndSamples) {
             // Treat this sched_switch sample as a switch-out.
             // Sometimes we have sched_switch samples but no context switch records; for
@@ -463,7 +510,6 @@ where
     ) {
         let pid = e.pid.expect("Can't handle samples without pids");
         // let tid = e.tid.expect("Can't handle samples without tids");
-        let process = self.processes.get_by_pid(pid, &mut self.profile);
 
         let Some(raw) = e.raw else { return };
         let Ok(rss_stat) = RssStat::parse(raw, self.endian) else {
@@ -474,6 +520,10 @@ where
             eprintln!("rss_stat record doesn't have a timestamp");
             return;
         };
+        if !self.is_in_time_range(timestamp_mono) {
+            return;
+        }
+        let process = self.processes.get_by_pid(pid, &mut self.profile);
         let timestamp = self.timestamp_converter.convert_time(timestamp_mono);
 
         let (prev_size_of_this_member, member) = match rss_stat.member {
@@ -553,6 +603,9 @@ where
         let timestamp_mono = e
             .timestamp
             .expect("Can't handle samples without timestamps");
+        if !self.is_in_time_range(timestamp_mono) {
+            return;
+        }
         let timestamp = self.timestamp_converter.convert_time(timestamp_mono);
         // let tid = e.tid.expect("Can't handle samples without tids");
         let process = self.processes.get_by_pid(pid, &mut self.profile);
@@ -862,6 +915,9 @@ where
         let timestamp = common
             .timestamp
             .expect("Can't handle context switch without time");
+        if !self.is_in_time_range(timestamp) {
+            return;
+        }
         let process = self.processes.get_by_pid(pid, &mut self.profile);
         let thread = process.threads.get_thread_by_tid(tid, &mut self.profile);
 

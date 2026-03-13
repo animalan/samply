@@ -30,6 +30,7 @@ pub fn convert<C: Read + Seek>(
     binary_lookup_dirs: Vec<PathBuf>,
     aux_file_lookup_dirs: Vec<PathBuf>,
     profile_creation_props: ProfileCreationProps,
+    time_range: Option<(std::time::Duration, std::time::Duration)>,
 ) -> Result<Profile, Error> {
     let perf_file = PerfFileReader::parse_file(cursor)?;
 
@@ -45,6 +46,7 @@ pub fn convert<C: Read + Seek>(
                 aux_file_lookup_dirs,
                 cache,
                 profile_creation_props,
+                time_range,
             )
         }
         _ => {
@@ -62,6 +64,7 @@ pub fn convert<C: Read + Seek>(
                 aux_file_lookup_dirs,
                 cache,
                 profile_creation_props,
+                time_range,
             )
         }
     };
@@ -75,6 +78,7 @@ fn convert_impl<U, C, R>(
     aux_file_lookup_dirs: Vec<PathBuf>,
     cache: U::Cache,
     profile_creation_props: ProfileCreationProps,
+    time_range: Option<(std::time::Duration, std::time::Duration)>,
 ) -> Profile
 where
     U: Unwinder<Module = Module<MmapRangeOrVec>> + Default,
@@ -178,6 +182,8 @@ where
         interpretation.clone(),
         simpleperf_symbol_tables,
         call_chain_return_addresses_are_preadjusted,
+        is_simpleperf,
+        time_range,
     );
 
     if let Some(android_version) = simpleperf_meta_info
