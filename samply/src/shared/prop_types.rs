@@ -130,7 +130,6 @@ pub struct ImportProps {
     pub included_processes: Option<IncludedProcesses>,
     #[allow(unused)] // Windows-only
     pub user_etl: Vec<PathBuf>,
-    #[allow(unused)] // todo: respect when converting perf.data
     pub time_range: Option<(std::time::Duration, std::time::Duration)>,
 }
 

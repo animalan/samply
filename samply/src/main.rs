@@ -202,6 +202,7 @@ fn convert_file_to_profile(
         binary_lookup_dirs,
         aux_file_lookup_dirs,
         import_props.profile_creation_props,
+        import_props.time_range,
     ) {
         Ok(profile) => profile,
         Err(error) => {

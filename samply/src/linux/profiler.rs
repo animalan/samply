@@ -360,6 +360,8 @@ fn make_converter(
         interpretation,
         None,
         false,
+        false,
+        None,
     );
     if let Ok(os_release) = os_release::OsRelease::new() {
         converter.set_os_name(&os_release.pretty_name);
